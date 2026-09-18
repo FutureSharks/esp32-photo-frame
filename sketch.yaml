@@ -1,0 +1,28 @@
+default_profile: s3
+
+profiles:
+  # The XIAO ESP32-S3 used for bring-up. PSRAM is not needed - the frame is
+  # streamed, never buffered - but the board has it.
+  s3:
+    fqbn: esp32:esp32:XIAO_ESP32S3:PSRAM=opi
+    port: /dev/cu.usbmodem1101
+    libraries:
+      - dir: libs/el133
+      - dir: libs/artfeed
+    platforms:
+      - platform: esp32:esp32 (3.3.11)
+        platform_index_url: https://espressif.github.io/arduino-esp32/package_esp32_index.json
+
+  # No PSRAM, 512 KB SRAM. Works because nothing ever holds the 960 KB frame.
+  # huge_app because the WiFi + TLS stack alone is ~1.1 MB, which overflows the
+  # default 1.2 MB app slot once anything else is added. This device has no OTA
+  # and no filesystem, so the trade costs nothing.
+  c6:
+    fqbn: esp32:esp32:XIAO_ESP32C6:PartitionScheme=huge_app
+    port: /dev/cu.usbmodem1101
+    libraries:
+      - dir: libs/el133
+      - dir: libs/artfeed
+    platforms:
+      - platform: esp32:esp32 (3.3.11)
+        platform_index_url: https://espressif.github.io/arduino-esp32/package_esp32_index.json
