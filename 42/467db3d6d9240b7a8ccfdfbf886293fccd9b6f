@@ -1,0 +1,87 @@
+libs/el133/src/el133.h
+  s_6e65d355469cbc::t_846430923200bc 54,57-62,79-115
+  s_6e65d355469cbc::t_321badb344902e 1-19,21-53,55-56,63-78
+  s_6e65d355469cbc::t_01612618eba149 20
+README.md
+  h_61c37ecb9a0034 2
+  s_6e65d355469cbc::t_72efe4c0ee23ae 1
+  s_6e65d355469cbc::t_d9b9f8b3a1ca31 3-35
+esp32-photo-frame.ino
+  h_61c37ecb9a0034 37,70
+  s_6e65d355469cbc::t_ae9fe0509c0768 25-28,31-32,64-66
+  s_6e65d355469cbc::t_0c080f5dcef726 20,24,29,33,38,47-48,99,110,113,119
+  s_6e65d355469cbc::t_286424906dde46 2,13-14,69
+  s_6e65d355469cbc::t_cc325c22101a0c 7,16,43,67-68,71-76
+  s_6e65d355469cbc::t_af9a36c7cfbc94 51-53,56,78-80
+  s_6e65d355469cbc::t_272fb75d6d93d2 57-58,60,62
+  s_6e65d355469cbc::t_c13ed64bc886c2 1,3-6,8-12,15,17-19,21-23,30,34-36,39-42,44-46,49-50,54-55,59,61,63,77,81-98,100-109,111-112,114-118,120-121
+libs/artfeed/src/artfeed.cpp
+  s_6e65d355469cbc::t_5af8c7dd1c012a 11-17,121-122
+  s_6e65d355469cbc::t_281cb622876c7d 210-223,328
+  s_6e65d355469cbc::t_219d180b35a029 1-10,18-26,31-74,88-90,92-120,123-166,168-173,175-209,224-225,237,254-256,259-268,271-283,285-294,296-314,316-327,329-330,334
+  s_6e65d355469cbc::t_ed55379e71b1f0 27-30,75-87,91
+  s_6e65d355469cbc::t_dc4b3d4bc2ec07 331-333
+  s_6e65d355469cbc::t_d7e4b9380acb5f 284,315
+  s_6e65d355469cbc::t_1af1732da8e3fe 226-236,238-253,257-258,269-270
+  s_6e65d355469cbc::t_3e135f84463a99 167,174,295
+sketch.yaml
+  s_6e65d355469cbc::t_c13ed64bc886c2 4-6,10-16,20,22-25
+  h_61c37ecb9a0034 1-3,7-9,26-28
+  s_6e65d355469cbc::t_2c35ec6802cc36 17-19,21
+libs/el133/src/el133.cpp
+  s_6e65d355469cbc::t_30399a28df7f9d 27
+  s_6e65d355469cbc::t_846430923200bc 115-120,130-131,137,139,145-159,198,250
+  s_6e65d355469cbc::t_01612618eba149 10
+  s_6e65d355469cbc::t_321badb344902e 1-9,11-26,28-114,121-129,132-136,138,140-144,160-197,199-249,251-316
+libs/artfeed/library.properties
+  s_6e65d355469cbc::t_01612618eba149 1-9
+libs/el133/src/el133_pins.h
+  s_6e65d355469cbc::t_321badb344902e 1-23
+.gitignore
+  s_6e65d355469cbc::t_7c75894b9d6269 71
+  s_6e65d355469cbc::t_c13ed64bc886c2 70
+libs/artfeed/src/artfeed.h
+  s_6e65d355469cbc::t_b46ea8aaabba9b 1-26,35-59
+  s_6e65d355469cbc::t_1af1732da8e3fe 27-34,60-62
+images/art/processed/manifest.txt
+  s_6e65d355469cbc::t_fda79baf632b12 1-5
+  s_6e65d355469cbc::t_d883644caa8fb7 6
+secrets.h.example
+  s_6e65d355469cbc::t_c13ed64bc886c2 1-5
+libs/el133/library.properties
+  s_6e65d355469cbc::t_01612618eba149 1-9
+tools/imgproc/main.go
+  s_6e65d355469cbc::t_fc10db56820f0c 59-64
+  s_6e65d355469cbc::t_cd72d9f9f610c6 1-4,9-39,42-58,65-197,200-267,274-287,289-295,297-298,300-312,317-325,328-362
+  s_960378696c1526::t_c03a1e33dd466b 5-8,40-41,198-199,268-273,288,296,299,313-316,326-327
+  s_960378696c1526::t_e21a3b8dbaa504 363-365
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.15",
+  "base_commit_sha": "42467db3d6d9240b7a8ccfdfbf886293fccd9b6f",
+  "prompts": {},
+  "humans": {
+    "h_61c37ecb9a0034": {
+      "author": "Max Williams <futuresharks@gmail.com>"
+    }
+  },
+  "sessions": {
+    "s_6e65d355469cbc": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "10e7f556-1660-42d5-8fcc-bb8215b83ac3",
+        "model": "claude-opus-5"
+      },
+      "human_author": null
+    },
+    "s_960378696c1526": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2b38b45c-d71a-4c79-8183-ab427306af19",
+        "model": "claude-opus-5"
+      },
+      "human_author": null
+    }
+  }
+}
