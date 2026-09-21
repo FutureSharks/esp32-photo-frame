@@ -22,12 +22,16 @@
 static const char *ART_BASE_URL =
     "https://raw.githubusercontent.com/FutureSharks/esp32-photo-frame/main/images/art/processed/";
 
-/* One image a day. */
-static const uint64_t SLEEP_INTERVAL_US = 24ULL * 60 * 60 * 1000000ULL;
+/* Cycle mode: step through every image in the manifest in order, pausing five
+ * minutes between them, to review the whole set. For normal use make this
+ * 24 * 60 * 60 and set CYCLE_ALL_IMAGES to 0. */
+#define CYCLE_ALL_IMAGES 1
+
+static const uint64_t SLEEP_INTERVAL_US = 5ULL * 60 * 1000000ULL;
 
 /* If a wake fails - no WiFi, a bad download - try again sooner rather than
- * leaving the frame stale for a whole day. */
-static const uint64_t RETRY_INTERVAL_US = 60ULL * 60 * 1000000ULL;
+ * leaving the frame stale. */
+static const uint64_t RETRY_INTERVAL_US = 5ULL * 60 * 1000000ULL;
 
 /* Paint colour blocks instead of fetching anything. Useful on the bench while
  * the hardware is still in pieces: it needs no network and exercises both
@@ -56,6 +60,9 @@ static void blocks_row(int prow, int half, uint8_t out[EL133_ROW_BYTES], void *)
 }
 #endif
 
+/* Does not return while deep sleep is enabled; waking restarts the sketch.
+ * Comment the three calls out again to keep the board alive between runs for
+ * bench work - the callers all stop on their own, so that stays safe. */
 static void sleepFor(uint64_t us, const char *why)
 {
     Serial.printf("[main] %s; sleeping %llu min\n", why, us / 60000000ULL);
@@ -88,11 +95,13 @@ void setup()
     cfg.ssid = WIFI_SSID;
     cfg.password = WIFI_PASSWORD;
     cfg.base_url = ART_BASE_URL;
+    cfg.sequential = CYCLE_ALL_IMAGES; /* walk the manifest in order */
 
     if (!artfeed_connect(cfg))
     {
         artfeed_disconnect();
         sleepFor(RETRY_INTERVAL_US, "network unavailable");
+        return;
     }
 
     char name[128];
@@ -100,6 +109,7 @@ void setup()
     {
         artfeed_disconnect();
         sleepFor(RETRY_INTERVAL_US, "could not read the manifest");
+        return;
     }
 
     /* Streams, then drops the radio before the refresh. On failure the panel
@@ -108,6 +118,7 @@ void setup()
     {
         artfeed_disconnect();
         sleepFor(RETRY_INTERVAL_US, "could not display the image");
+        return;
     }
 
     Serial.printf("[main] showing \"%s\"\n", name);

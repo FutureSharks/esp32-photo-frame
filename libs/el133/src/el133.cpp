@@ -9,6 +9,17 @@
 
 #include "el133_pins.h"
 #include <SPI.h>
+#include <soc/soc_caps.h>
+
+/* Which SPI peripheral to drive the panel from. The S3 has a spare general
+ * purpose bus (SPI3 / HSPI); the C6 and the other single-bus parts have only
+ * SPI2, where HSPI is out of range and spiStartBus() refuses it at runtime -
+ * the build succeeds and the panel simply never receives anything. */
+#if SOC_SPI_PERIPH_NUM > 2
+#define EL133_SPI_BUS HSPI
+#else
+#define EL133_SPI_BUS FSPI
+#endif
 
 /* The panel's SPI clock. The Pico reference runs the 13.3" at 4 MHz; Pimoroni
  * uses 10 MHz on the Pi. 4 MHz costs ~2 s extra on a 960 KB frame, which is
@@ -24,7 +35,7 @@ static const uint32_t EL133_CMD_SETUP_MS = 300;
 static const uint32_t EL133_ASSERT_TIMEOUT_MS = 5000;
 static const uint32_t EL133_REFRESH_TIMEOUT_MS = 60000;
 
-static SPIClass el133_spi(HSPI);
+static SPIClass el133_spi(EL133_SPI_BUS);
 static bool el133_verbose = false;
 static uint8_t el133_dtm_cs; /* CS held during the current DTM stream */
 

@@ -40,6 +40,7 @@ static bool artfeed_verbose = false;
 ArtfeedConfig artfeed_default_config()
 {
     ArtfeedConfig cfg = {};
+    cfg.sequential = false;
     cfg.avoid_recent = 8;
     cfg.insecure = false;
     cfg.wifi_timeout_ms = 30000;
@@ -127,6 +128,45 @@ static void artfeed_prepare(const ArtfeedConfig &cfg, NetworkClientSecure &clien
     http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
 }
 
+/* Report why a request failed in enough detail to tell the causes apart: a
+ * negative code is a transport failure (DNS, TCP, TLS), a positive one is an
+ * HTTP status and the server said something worth reading. A 404 body of
+ * "404: Not Found" means the file is not on the host - most often because the
+ * commit adding it has not been pushed. */
+static void artfeed_report_failure(NetworkClientSecure &client, HTTPClient &http,
+                                   const char *what, const char *url, int code)
+{
+    if (!artfeed_verbose)
+        return;
+
+    Serial.printf("[feed] %s failed\n", what);
+    Serial.printf("[feed]   url    %s\n", url);
+    Serial.printf("[feed]   code   %d (%s)\n", code, http.errorToString(code).c_str());
+
+    if (code < 0)
+    {
+        /* Transport-level: nothing HTTP to show, but mbedTLS usually has a
+         * reason, and the WiFi state distinguishes "lost the AP" from
+         * "handshake rejected". */
+        char err[128] = {0};
+        int tls = client.lastError(err, sizeof(err));
+        Serial.printf("[feed]   tls    %d %s\n", tls, err[0] ? err : "(no detail)");
+        Serial.printf("[feed]   wifi   %s, rssi %d dBm, dns %s\n",
+                      WiFi.isConnected() ? "connected" : "DISCONNECTED",
+                      (int)WiFi.RSSI(), WiFi.dnsIP().toString().c_str());
+    }
+    else
+    {
+        Serial.printf("[feed]   length %d\n", http.getSize());
+        String body = http.getString();
+        if (body.length() > 160)
+            body = body.substring(0, 160) + "...";
+        body.replace("\n", " ");
+        Serial.printf("[feed]   body   %s\n", body.c_str());
+    }
+    Serial.printf("[feed]   heap   %u free\n", (unsigned)ESP.getFreeHeap());
+}
+
 /* Remember the last few choices so the same piece does not come round twice in
  * a row. Stored as a ring in NVS. */
 static bool artfeed_recently_shown(Preferences &prefs, uint8_t depth, const char *name)
@@ -162,23 +202,26 @@ bool artfeed_pick(const ArtfeedConfig &cfg, char *name, size_t name_len)
     HTTPClient http;
     artfeed_prepare(cfg, client, http);
 
+    ARTFEED_LOG("[feed] GET %s\n", url.c_str());
     if (!http.begin(client, url))
     {
-        ARTFEED_LOG("[feed] cannot parse %s\n", url.c_str());
+        ARTFEED_LOG("[feed] cannot parse url %s\n", url.c_str());
         return false;
     }
 
+    uint32_t t0 = millis();
     int code = http.GET();
     if (code != HTTP_CODE_OK)
     {
-        ARTFEED_LOG("[feed] manifest GET failed: %d (%s)\n", code,
-                    http.errorToString(code).c_str());
+        artfeed_report_failure(client, http, "manifest GET", url.c_str(), code);
         http.end();
         return false;
     }
 
     String body = http.getString();
     http.end();
+    ARTFEED_LOG("[feed] manifest: %u bytes in %lu ms\n", (unsigned)body.length(),
+                (unsigned long)(millis() - t0));
 
     /* Collect the line offsets rather than copying the names; a manifest of a
      * few hundred entries is only a few KB, but there is no reason to double
@@ -210,7 +253,12 @@ bool artfeed_pick(const ArtfeedConfig &cfg, char *name, size_t name_len)
 
     if (count == 0)
     {
-        ARTFEED_LOG("[feed] manifest is empty\n");
+        /* The request succeeded but produced no usable lines - normally an
+         * error page served with a 200, or a manifest of only comments. */
+        String preview = body.substring(0, body.length() < 160 ? body.length() : 160);
+        preview.replace("\n", " ");
+        ARTFEED_LOG("[feed] manifest has no usable entries; body was: %s\n",
+                    preview.c_str());
         return false;
     }
     ARTFEED_LOG("[feed] manifest lists %u image(s)\n", (unsigned)count);
@@ -218,24 +266,40 @@ bool artfeed_pick(const ArtfeedConfig &cfg, char *name, size_t name_len)
     Preferences prefs;
     prefs.begin("artfeed", false);
 
-    /* esp_random() is a real hardware RNG, so no seeding needed. Try a handful
-     * of times to dodge a recent repeat, then accept whatever we have - with
-     * fewer images than the avoid depth, every choice is a repeat. */
-    uint8_t depth = cfg.avoid_recent;
-    if (depth >= count)
-        depth = (count > 1) ? (uint8_t)(count - 1) : 0;
-
     size_t chosen = 0;
-    for (int attempt = 0; attempt < 12; attempt++)
+    uint8_t depth = 0;
+
+    if (cfg.sequential)
     {
-        chosen = (size_t)(esp_random() % count);
-        String candidate = body.substring(starts[chosen], starts[chosen] + lengths[chosen]);
-        if (depth == 0 || !artfeed_recently_shown(prefs, depth, candidate.c_str()))
-            break;
+        /* Resume where the last wake left off. Taken modulo the current count
+         * so the position stays valid when images are added or removed. */
+        uint32_t pos = prefs.getUInt("seq", 0) % count;
+        chosen = (size_t)pos;
+        prefs.putUInt("seq", (uint32_t)((pos + 1) % count));
+    }
+    else
+    {
+        /* esp_random() is a real hardware RNG, so no seeding needed. Try a
+         * handful of times to dodge a recent repeat, then accept whatever we
+         * have - with fewer images than the avoid depth, every choice is a
+         * repeat. */
+        depth = cfg.avoid_recent;
+        if (depth >= count)
+            depth = (count > 1) ? (uint8_t)(count - 1) : 0;
+
+        for (int attempt = 0; attempt < 12; attempt++)
+        {
+            chosen = (size_t)(esp_random() % count);
+            String candidate =
+                body.substring(starts[chosen], starts[chosen] + lengths[chosen]);
+            if (depth == 0 || !artfeed_recently_shown(prefs, depth, candidate.c_str()))
+                break;
+        }
     }
 
     String pick = body.substring(starts[chosen], starts[chosen] + lengths[chosen]);
-    artfeed_remember(prefs, depth, pick.c_str());
+    if (!cfg.sequential)
+        artfeed_remember(prefs, depth, pick.c_str());
     prefs.end();
 
     if (pick.length() + 1 > name_len)
@@ -246,8 +310,8 @@ bool artfeed_pick(const ArtfeedConfig &cfg, char *name, size_t name_len)
     strncpy(name, pick.c_str(), name_len - 1);
     name[name_len - 1] = '\0';
 
-    ARTFEED_LOG("[feed] chose \"%s\" (%u of %u)\n", name, (unsigned)(chosen + 1),
-                (unsigned)count);
+    ARTFEED_LOG("[feed] chose \"%s\" (%u of %u, %s)\n", name, (unsigned)(chosen + 1),
+                (unsigned)count, cfg.sequential ? "in order" : "random");
     return true;
 }
 
@@ -255,21 +319,29 @@ bool artfeed_show(const ArtfeedConfig &cfg, const char *name)
 {
     String url = String(cfg.base_url) + name;
 
+    /* Init the panel first. It takes ~7 s of blocking delays, and doing that
+     * after the response headers arrive leaves the socket unread for long
+     * enough that the receive window fills and the connection stalls or the
+     * server drops it. Nothing is displayed until the refresh, so paying this
+     * cost before we know the download will succeed is harmless. */
+    uint32_t t0 = millis();
+    el133_init_panel();
+
     NetworkClientSecure client;
     HTTPClient http;
     artfeed_prepare(cfg, client, http);
 
+    ARTFEED_LOG("[feed] GET %s\n", url.c_str());
     if (!http.begin(client, url))
     {
-        ARTFEED_LOG("[feed] cannot parse %s\n", url.c_str());
+        ARTFEED_LOG("[feed] cannot parse url %s\n", url.c_str());
         return false;
     }
 
     int code = http.GET();
     if (code != HTTP_CODE_OK)
     {
-        ARTFEED_LOG("[feed] image GET failed: %d (%s)\n", code,
-                    http.errorToString(code).c_str());
+        artfeed_report_failure(client, http, "image GET", url.c_str(), code);
         http.end();
         return false;
     }
@@ -277,16 +349,16 @@ bool artfeed_show(const ArtfeedConfig &cfg, const char *name)
     int size = http.getSize();
     if (size >= 0 && (size_t)size != EL133_STREAM_BYTES)
     {
-        ARTFEED_LOG("[feed] wrong length: %d bytes, expected %u\n", size,
-                    (unsigned)EL133_STREAM_BYTES);
+        /* Almost always an HTML error page served with a 200, or a frame packed
+         * for different geometry. */
+        ARTFEED_LOG("[feed] wrong length: %d bytes, expected %u - not a packed frame?\n",
+                    size, (unsigned)EL133_STREAM_BYTES);
         http.end();
         return false;
     }
 
-    /* Only now touch the panel: a failure above has cost nothing. */
-    ARTFEED_LOG("[feed] streaming %s\n", name);
-    uint32_t t0 = millis();
-    el133_init_panel();
+    ARTFEED_LOG("[feed] streaming %u bytes\n", (unsigned)EL133_STREAM_BYTES);
+    t0 = millis();
 
     WiFiClient *stream = http.getStreamPtr();
     uint8_t buf[ARTFEED_CHUNK];
@@ -297,19 +369,54 @@ bool artfeed_show(const ArtfeedConfig &cfg, const char *name)
         el133_stream_begin(half);
 
         size_t remaining = EL133_HALF_BYTES;
+        uint32_t lastData = millis();
+        size_t nextMark = EL133_HALF_BYTES - EL133_HALF_BYTES / 4;
+
         while (remaining > 0)
         {
             size_t want = remaining < sizeof(buf) ? remaining : sizeof(buf);
             int got = stream->readBytes(buf, want);
-            if (got <= 0)
+
+            if (got > 0)
             {
-                ARTFEED_LOG("[feed] stream ended %u bytes early in half %d\n",
+                el133_stream_write(buf, (size_t)got);
+                remaining -= (size_t)got;
+                lastData = millis();
+
+                if (remaining <= nextMark)
+                {
+                    ARTFEED_LOG("[feed]   half %d: %u of %u bytes\n", half,
+                                (unsigned)(EL133_HALF_BYTES - remaining),
+                                (unsigned)EL133_HALF_BYTES);
+                    nextMark = (nextMark > EL133_HALF_BYTES / 4)
+                                   ? nextMark - EL133_HALF_BYTES / 4
+                                   : 0;
+                }
+                continue;
+            }
+
+            /* An empty read is not automatically the end: TLS records arrive in
+             * bursts and the window can stall briefly. Only give up once the
+             * peer has gone and there is nothing buffered, or nothing has
+             * arrived for a while. */
+            if (!stream->connected() && stream->available() == 0)
+            {
+                ARTFEED_LOG("[feed] connection closed with %u bytes of half %d "
+                            "outstanding\n",
                             (unsigned)remaining, half);
                 ok = false;
                 break;
             }
-            el133_stream_write(buf, (size_t)got);
-            remaining -= (size_t)got;
+            if (millis() - lastData > cfg.http_timeout_ms)
+            {
+                ARTFEED_LOG("[feed] stalled for %lu ms with %u bytes of half %d "
+                            "outstanding\n",
+                            (unsigned long)(millis() - lastData), (unsigned)remaining,
+                            half);
+                ok = false;
+                break;
+            }
+            delay(10);
         }
 
         el133_stream_end();

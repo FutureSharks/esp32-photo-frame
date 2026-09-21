@@ -24,8 +24,14 @@ struct ArtfeedConfig
      * is expected at <base_url>manifest.txt. */
     const char *base_url;
 
-    /* How many recently shown images to avoid repeating. Kept in NVS, so it
-     * survives deep sleep and power loss. 0 disables the check. */
+    /* Walk the manifest in order instead of picking at random, resuming where
+     * the last wake left off. Useful for reviewing every image in turn;
+     * avoid_recent is ignored in this mode. The position is kept in NVS, so it
+     * survives deep sleep and power loss. */
+    bool sequential;
+
+    /* How many recently shown images to avoid repeating in random mode. Kept in
+     * NVS, so it survives deep sleep and power loss. 0 disables the check. */
     uint8_t avoid_recent;
 
     /* Skip TLS certificate validation. Convenient while bringing the network
@@ -51,9 +57,10 @@ bool artfeed_connect(const ArtfeedConfig &cfg);
  * biggest saving in the whole wake cycle. */
 void artfeed_disconnect();
 
-/* Fetch the manifest and choose an image, avoiding recent repeats. The chosen
- * name is written to `name`. Returns false if the manifest could not be read or
- * is empty. */
+/* Fetch the manifest and choose an image - the next one in order if
+ * cfg.sequential, otherwise at random avoiding recent repeats. The chosen name
+ * is written to `name`. Returns false if the manifest could not be read or is
+ * empty. */
 bool artfeed_pick(const ArtfeedConfig &cfg, char *name, size_t name_len);
 
 /* Download `name` and stream it into the panel. Does the panel init, streams

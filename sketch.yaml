@@ -1,4 +1,4 @@
-default_profile: s3
+default_profile: c6
 
 profiles:
   # The XIAO ESP32-S3 used for bring-up. PSRAM is not needed - the frame is

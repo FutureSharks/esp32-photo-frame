@@ -2,20 +2,32 @@
 // (EL133UF1 / Spectra 6) can display directly.
 //
 // Everything expensive happens here rather than on the device: scaling,
-// cropping, reduction to the panel's six colours, dithering, and the split
-// between the two controllers. The panel is hung in portrait, so images are
-// composed directly in the controllers' portrait scan order - no rotation is
-// needed. What lands in images/art/processed/ is the exact byte stream the
-// firmware pushes over SPI, so the ESP32 needs no image decoding and no
-// framebuffer - it copies bytes from the socket to the panel.
+// cropping, tone mapping into the panel's much narrower range, reduction to
+// its six inks, dithering, and the split between the two controllers. The
+// panel is hung in portrait, so images are composed directly in the
+// controllers' portrait scan order - no rotation is needed. What lands in
+// images/art/processed/ is the exact byte stream the firmware pushes over SPI,
+// so the ESP32 needs no image decoding and no framebuffer - it copies bytes
+// from the socket to the panel.
 //
-// Usage:
+// The tone pipeline, the calibrated palettes and the dither kernels are ported
+// from paperlesspaper's epdoptimize (Apache-2.0), which is a browser library;
+// see palette.go, tone.go and dither.go.
 //
-//	go run ./tools/imgproc                      # images/art/*.jpg -> images/art/processed/
-//	go run ./tools/imgproc -saturation 0.7      # more vivid, less faithful
-//	go run ./tools/imgproc -fit contain         # letterbox instead of cropping
+// Usage, from the repository root - the default -in and -out are relative to
+// it, and the Go module is rooted there:
 //
-// Output format, per file (960,000 bytes):
+//	go run ./tools/imgproc                        # images/art/*.jpg -> images/art/processed/
+//	go run ./tools/imgproc -preset restore        # rescue faded scans and paintings
+//	go run ./tools/imgproc -preset posterscan     # warm paper, strong flat colour
+//	go run ./tools/imgproc -fit contain           # letterbox instead of cropping
+//	go run ./tools/imgproc -list-presets          # and -list-palettes, -list-kernels
+//
+// Alongside each source image it writes a JPEG preview of the dithered result
+// at the source's own resolution, so the two can be flipped between in any
+// image viewer. Previews are build output and are gitignored.
+//
+// Output format, per .bin file (960,000 bytes):
 //
 //	bytes      0..479,999  CS_M half: 1600 rows of 300 bytes, portrait columns 0..599
 //	bytes 480,000..959,999  CS_S half: same, portrait columns 600..1199
@@ -28,7 +40,7 @@ import (
 	"flag"
 	"fmt"
 	"image"
-	_ "image/jpeg"
+	"image/jpeg"
 	_ "image/png"
 	"math"
 	"os"
@@ -48,57 +60,95 @@ const (
 	streamBytes = halfBytes * 2
 )
 
-// The panel's 4-bit colour codes. Note 0x4 is not a colour.
-var panelCodes = [6]byte{0x0, 0x1, 0x2, 0x3, 0x5, 0x6}
+// previewSuffix replaces the source's extension, so images/art/foo.jpg gets
+// images/art/foo.preview.jpg. findSources skips anything matching it, or the
+// next run would treat previews as new source images.
+const previewSuffix = ".preview.jpg"
 
-// Pimoroni's two reference palettes. The saturated set is roughly what the ink
-// actually produces; the desaturated set is the idealised primaries. Blending
-// between them trades colour accuracy for punch - see -saturation.
-var (
-	saturatedPalette = [6][3]float64{
-		{0, 0, 0},       // black
-		{161, 164, 165}, // white
-		{208, 190, 71},  // yellow
-		{156, 72, 75},   // red
-		{61, 59, 94},    // blue
-		{58, 91, 70},    // green
-	}
-	desaturatedPalette = [6][3]float64{
-		{0, 0, 0},
-		{255, 255, 255},
-		{255, 255, 0},
-		{255, 0, 0},
-		{0, 0, 255},
-		{0, 255, 0},
-	}
-)
+type config struct {
+	palette       [6]PaletteEntry
+	paletteName   string
+	dither        [6]RGB // calibrated colours, blended by -saturation
+	preview       [6]RGB // what the preview is painted with
+	saturation    float64
+	preset        Preset
+	processing    ImageProcessing
+	fit           string
+	kernel        []kernelTap
+	kernelName    string
+	matchMode     string
+	serpentine    bool
+	writePreview  bool
+	previewSource string
+	previewQual   int
+}
 
-func blendPalette(saturation float64) [6][3]float64 {
-	var p [6][3]float64
-	for i := 0; i < 6; i++ {
-		for c := 0; c < 3; c++ {
-			p[i][c] = saturatedPalette[i][c]*saturation +
-				desaturatedPalette[i][c]*(1-saturation)
-		}
-	}
-	return p
+// fingerprint is every setting that changes the packed stream. It is recorded
+// in the manifest so that changing one of them invalidates the whole batch -
+// mtimes alone cannot see a flag change.
+func (c config) fingerprint() string {
+	return fmt.Sprintf(
+		"palette=%s saturation=%.3f preset=%s fit=%s kernel=%s match=%s serpentine=%t",
+		c.paletteName, c.saturation, c.preset.Name, c.fit, c.kernelName,
+		c.matchMode, c.serpentine,
+	)
 }
 
 func main() {
 	in := flag.String("in", "images/art", "directory of source images")
 	out := flag.String("out", "images/art/processed", "directory for packed frames")
-	saturation := flag.Float64("saturation", 0.5,
-		"0 = idealised primaries, 1 = measured ink colours")
+	paletteName := flag.String("palette", "spectra6",
+		"calibrated display palette (-list-palettes)")
+	presetName := flag.String("preset", "balanced",
+		"tone processing preset (-list-presets)")
+	saturation := flag.Float64("saturation", 1,
+		"1 = dither against measured ink, 0 = against idealised primaries")
 	fit := flag.String("fit", "cover",
 		"cover (fill the panel, cropping overflow) or contain (letterbox on white)")
-	force := flag.Bool("force", false, "repack images whose .bin is already up to date")
+	kernelName := flag.String("dither", "",
+		"error diffusion kernel; empty uses the preset's (-list-kernels)")
+	matchMode := flag.String("match", "",
+		"colour matching: rgb, lab, chroma or weighted; empty uses the preset's")
+	serpentine := flag.Bool("serpentine", true,
+		"reverse alternate rows while diffusing, which suppresses worming")
+	writePreview := flag.Bool("preview", true,
+		"write a JPEG of the result next to each source image")
+	previewSource := flag.String("preview-source", "full",
+		"full (whole image at its own resolution) or panel (the 1200x1600 frame)")
+	previewColors := flag.String("preview-colors", "calibrated",
+		"calibrated (how the panel will look) or device (the raw primaries)")
+	previewQual := flag.Int("preview-quality", 92, "JPEG quality for previews")
+	force := flag.Bool("force", false, "repack images whose output is already up to date")
+
+	listPalettes := flag.Bool("list-palettes", false, "print the available palettes and exit")
+	listPresets := flag.Bool("list-presets", false, "print the available presets and exit")
+	listKernels := flag.Bool("list-kernels", false, "print the available dither kernels and exit")
 	flag.Parse()
 
-	if *fit != "cover" && *fit != "contain" {
-		fatalf("-fit must be cover or contain, got %q", *fit)
+	switch {
+	case *listPalettes:
+		for _, name := range paletteNames() {
+			fmt.Printf("  %-20s %s\n", name, paletteSpecs[name].desc)
+		}
+		return
+	case *listPresets:
+		for _, name := range presetNames() {
+			p := presets[name]
+			fmt.Printf("  %-12s %s\n", name, p.Description)
+			fmt.Printf("  %-12s   dither=%s match=%s\n", "", p.Kernel, p.ColorMatching)
+		}
+		return
+	case *listKernels:
+		for _, name := range kernelNames() {
+			fmt.Printf("  %s\n", name)
+		}
+		return
 	}
-	if *saturation < 0 || *saturation > 1 {
-		fatalf("-saturation must be between 0 and 1, got %v", *saturation)
+
+	cfg, err := buildConfig(*paletteName, *presetName, *fit, *kernelName, *matchMode,
+		*previewSource, *previewColors, *saturation, *previewQual, *serpentine, *writePreview)
+	if err != nil {
+		fatalf("%v", err)
 	}
 
 	sources, err := findSources(*in)
@@ -113,26 +163,36 @@ func main() {
 		fatalf("creating %s: %v", *out, err)
 	}
 
-	palette := blendPalette(*saturation)
-	var packed []string
+	manifest := filepath.Join(*out, "manifest.txt")
+	fingerprint := cfg.fingerprint()
+	// A settings change makes every existing .bin wrong, not just stale.
+	settingsChanged := readManifestSettings(manifest) != fingerprint
+	repackAll := *force || settingsChanged
+	if settingsChanged && !*force {
+		fmt.Println("settings changed since the last run; repacking everything")
+	}
 
+	fmt.Printf("%s\n\n", fingerprint)
+
+	var packed []string
 	for _, src := range sources {
 		name := strings.TrimSuffix(filepath.Base(src), filepath.Ext(src)) + ".bin"
 		dst := filepath.Join(*out, name)
+		previewPath := previewPathFor(src)
 
-		if !*force && upToDate(src, dst) {
-			fmt.Printf("  %-40s up to date\n", filepath.Base(src))
+		if !repackAll && upToDate(src, dst, previewPath, cfg.writePreview) {
+			fmt.Printf("  %-44s up to date\n", filepath.Base(src))
 			packed = append(packed, name)
 			continue
 		}
 
-		if err := process(src, dst, palette, *fit); err != nil {
+		if err := process(src, dst, previewPath, cfg); err != nil {
 			// One bad file should not stop the batch; it just will not appear
 			// in the manifest, so the device never asks for it.
-			fmt.Fprintf(os.Stderr, "  %-40s FAILED: %v\n", filepath.Base(src), err)
+			fmt.Fprintf(os.Stderr, "  %-44s FAILED: %v\n", filepath.Base(src), err)
 			continue
 		}
-		fmt.Printf("  %-40s -> %s\n", filepath.Base(src), name)
+		fmt.Printf("  %-44s -> %s\n", filepath.Base(src), name)
 		packed = append(packed, name)
 	}
 
@@ -141,11 +201,88 @@ func main() {
 	}
 
 	sort.Strings(packed)
-	manifest := filepath.Join(*out, "manifest.txt")
-	if err := writeManifest(manifest, packed); err != nil {
+	if err := writeManifest(manifest, packed, fingerprint); err != nil {
 		fatalf("writing %s: %v", manifest, err)
 	}
 	fmt.Printf("\n%d image(s), %s\n", len(packed), manifest)
+}
+
+func buildConfig(paletteName, presetName, fit, kernelName, matchMode,
+	previewSource, previewColors string, saturation float64, previewQual int,
+	serpentine, writePreview bool) (config, error) {
+
+	var cfg config
+
+	if fit != "cover" && fit != "contain" {
+		return cfg, fmt.Errorf("-fit must be cover or contain, got %q", fit)
+	}
+	if saturation < 0 || saturation > 1 {
+		return cfg, fmt.Errorf("-saturation must be between 0 and 1, got %v", saturation)
+	}
+	if previewSource != "full" && previewSource != "panel" {
+		return cfg, fmt.Errorf("-preview-source must be full or panel, got %q", previewSource)
+	}
+	if previewColors != "calibrated" && previewColors != "device" {
+		return cfg, fmt.Errorf("-preview-colors must be calibrated or device, got %q", previewColors)
+	}
+	if previewQual < 1 || previewQual > 100 {
+		return cfg, fmt.Errorf("-preview-quality must be between 1 and 100, got %d", previewQual)
+	}
+
+	entries, err := lookupPalette(paletteName)
+	if err != nil {
+		return cfg, err
+	}
+	preset, err := lookupPreset(presetName)
+	if err != nil {
+		return cfg, err
+	}
+
+	if kernelName == "" {
+		kernelName = preset.Kernel
+	}
+	kernel, err := lookupKernel(kernelName)
+	if err != nil {
+		return cfg, err
+	}
+
+	if matchMode == "" {
+		matchMode = preset.ColorMatching
+	}
+	if !validMatchMode(matchMode) {
+		return cfg, fmt.Errorf("-match must be one of %s, got %q",
+			strings.Join(matchModeNames(), ", "), matchMode)
+	}
+
+	cfg = config{
+		palette:       entries,
+		paletteName:   strings.ToLower(paletteName),
+		dither:        blend(entries, saturation),
+		saturation:    saturation,
+		preset:        preset,
+		processing:    preset.processing(),
+		fit:           fit,
+		kernel:        kernel,
+		kernelName:    kernelName,
+		matchMode:     matchMode,
+		serpentine:    serpentine,
+		writePreview:  writePreview,
+		previewSource: previewSource,
+		previewQual:   previewQual,
+	}
+
+	// The preview is normally painted in the calibrated colours, because those
+	// are what the ink looks like; the device primaries are only useful for
+	// checking which ink was chosen where.
+	cfg.preview = cfg.dither
+	if previewColors == "device" {
+		cfg.preview = deviceColors(entries)
+	}
+	return cfg, nil
+}
+
+func previewPathFor(src string) string {
+	return strings.TrimSuffix(src, filepath.Ext(src)) + previewSuffix
 }
 
 func findSources(dir string) ([]string, error) {
@@ -155,7 +292,7 @@ func findSources(dir string) ([]string, error) {
 	}
 	var out []string
 	for _, e := range entries {
-		if e.IsDir() {
+		if e.IsDir() || strings.HasSuffix(strings.ToLower(e.Name()), previewSuffix) {
 			continue
 		}
 		switch strings.ToLower(filepath.Ext(e.Name())) {
@@ -167,20 +304,28 @@ func findSources(dir string) ([]string, error) {
 	return out, nil
 }
 
-// upToDate reports whether dst exists, is the right size, and is newer than src.
-func upToDate(src, dst string) bool {
-	di, err := os.Stat(dst)
-	if err != nil || di.Size() != streamBytes {
-		return false
-	}
+// upToDate reports whether every output for src exists and is newer than it.
+func upToDate(src, dst, previewPath string, wantPreview bool) bool {
 	si, err := os.Stat(src)
 	if err != nil {
 		return false
 	}
-	return di.ModTime().After(si.ModTime())
+
+	di, err := os.Stat(dst)
+	if err != nil || di.Size() != streamBytes || !di.ModTime().After(si.ModTime()) {
+		return false
+	}
+
+	if wantPreview {
+		pi, err := os.Stat(previewPath)
+		if err != nil || !pi.ModTime().After(si.ModTime()) {
+			return false
+		}
+	}
+	return true
 }
 
-func process(src, dst string, palette [6][3]float64, fit string) error {
+func process(src, dst, previewPath string, cfg config) error {
 	f, err := os.Open(src)
 	if err != nil {
 		return err
@@ -192,13 +337,56 @@ func process(src, dst string, palette [6][3]float64, fit string) error {
 		return fmt.Errorf("decoding: %w", err)
 	}
 
-	// Scale to the panel, then reduce to six colours. Dithering happens on the
-	// final-size image so the error diffuses across pixels the panel actually
-	// has, rather than being smeared by a later resize.
-	rgb := resample(img, portraitW, portraitH, fit)
-	indices := dither(rgb, portraitW, portraitH, palette)
+	pal := newMatchPalette(cfg.dither[:], cfg.matchMode)
 
-	return writeFrame(dst, indices)
+	// The panel frame. Tone mapping and dithering both happen at the final
+	// size, so error diffuses across pixels the panel actually has rather
+	// than being smeared by a later resize.
+	frame := resample(img, portraitW, portraitH, cfg.fit)
+	applyImageProcessing(frame, cfg.processing, cfg.dither[:])
+	indices := errorDiffuse(frame, pal, cfg.kernel, cfg.serpentine)
+
+	if err := writeFrame(dst, indices); err != nil {
+		return err
+	}
+
+	if !cfg.writePreview {
+		return nil
+	}
+
+	previewIndices, w, h := indices, portraitW, portraitH
+	if cfg.previewSource == "full" {
+		// The whole image, uncropped, at its own resolution - the version to
+		// flip against the original. Note that the dither runs at this size,
+		// so the dot pattern is finer than the panel's, and an "auto" dynamic
+		// range pass measures this framing rather than the cropped one.
+		b := img.Bounds()
+		w, h = b.Dx(), b.Dy()
+		full := toImage(img)
+		applyImageProcessing(full, cfg.processing, cfg.dither[:])
+		previewIndices = errorDiffuse(full, pal, cfg.kernel, cfg.serpentine)
+	}
+
+	return writeJPEG(previewPath, render(previewIndices, w, h, cfg.preview[:]), cfg.previewQual)
+}
+
+// toImage copies a decoded image into the byte buffer the stages work on.
+func toImage(src image.Image) *Image {
+	b := src.Bounds()
+	out := NewImage(b.Dx(), b.Dy())
+
+	i := 0
+	for y := b.Min.Y; y < b.Max.Y; y++ {
+		for x := b.Min.X; x < b.Max.X; x++ {
+			// Go returns 16-bit premultiplied values; scale to 0..255.
+			r, g, bl, _ := src.At(x, y).RGBA()
+			out.Pix[i] = uint8(r / 257)
+			out.Pix[i+1] = uint8(g / 257)
+			out.Pix[i+2] = uint8(bl / 257)
+			i += 3
+		}
+	}
+	return out
 }
 
 // resample scales src to exactly w x h using bilinear interpolation.
@@ -206,7 +394,7 @@ func process(src, dst string, palette [6][3]float64, fit string) error {
 // "cover" scales to fill and centre-crops the overflow; "contain" scales to fit
 // and pads with white, which on this panel is a real ink colour rather than an
 // absence of one.
-func resample(src image.Image, w, h int, fit string) []float64 {
+func resample(src image.Image, w, h int, fit string) *Image {
 	b := src.Bounds()
 	sw, sh := b.Dx(), b.Dy()
 
@@ -218,14 +406,14 @@ func resample(src image.Image, w, h int, fit string) []float64 {
 	dw, dh := int(math.Round(float64(sw)*scale)), int(math.Round(float64(sh)*scale))
 	offX, offY := (dw-w)/2, (dh-h)/2 // negative under "contain": the padding
 
-	out := make([]float64, w*h*3)
+	out := NewImage(w, h)
 	for y := 0; y < h; y++ {
 		for x := 0; x < w; x++ {
 			dx, dy := x+offX, y+offY
 			i := (y*w + x) * 3
 
 			if dx < 0 || dy < 0 || dx >= dw || dy >= dh {
-				out[i], out[i+1], out[i+2] = 255, 255, 255 // letterbox
+				out.Pix[i], out.Pix[i+1], out.Pix[i+2] = 255, 255, 255 // letterbox
 				continue
 			}
 
@@ -233,7 +421,9 @@ func resample(src image.Image, w, h int, fit string) []float64 {
 			fx := (float64(dx)+0.5)/scale - 0.5
 			fy := (float64(dy)+0.5)/scale - 0.5
 			r, g, bl := bilinear(src, b, sw, sh, fx, fy)
-			out[i], out[i+1], out[i+2] = r, g, bl
+			out.Pix[i] = clampByte(r)
+			out.Pix[i+1] = clampByte(g)
+			out.Pix[i+2] = clampByte(bl)
 		}
 	}
 	return out
@@ -244,9 +434,8 @@ func bilinear(src image.Image, b image.Rectangle, sw, sh int, fx, fy float64) (f
 	tx, ty := fx-float64(x0), fy-float64(y0)
 
 	at := func(x, y int) (float64, float64, float64) {
-		x = clamp(x, 0, sw-1)
-		y = clamp(y, 0, sh-1)
-		// Go returns 16-bit premultiplied values; scale to 0..255.
+		x = clampInt(x, 0, sw-1)
+		y = clampInt(y, 0, sh-1)
 		r, g, bl, _ := src.At(b.Min.X+x, b.Min.Y+y).RGBA()
 		return float64(r) / 257, float64(g) / 257, float64(bl) / 257
 	}
@@ -261,53 +450,6 @@ func bilinear(src image.Image, b image.Rectangle, sw, sh int, fx, fy float64) (f
 	g := lerp(lerp(g00, g10, tx), lerp(g01, g11, tx), ty)
 	bl := lerp(lerp(b00, b10, tx), lerp(b01, b11, tx), ty)
 	return r, g, bl
-}
-
-// dither reduces the image to palette indices using Floyd-Steinberg error
-// diffusion, which is what makes six colours look like a photograph.
-func dither(rgb []float64, w, h int, palette [6][3]float64) []uint8 {
-	indices := make([]uint8, w*h)
-
-	for y := 0; y < h; y++ {
-		for x := 0; x < w; x++ {
-			i := (y*w + x) * 3
-			r, g, b := rgb[i], rgb[i+1], rgb[i+2]
-
-			best, bestDist := 0, math.MaxFloat64
-			for p := 0; p < 6; p++ {
-				dr := r - palette[p][0]
-				dg := g - palette[p][1]
-				db := b - palette[p][2]
-				// Weighted for perceived brightness; plain Euclidean distance
-				// in RGB tends to pick green far too often.
-				d := 0.299*dr*dr + 0.587*dg*dg + 0.114*db*db
-				if d < bestDist {
-					best, bestDist = p, d
-				}
-			}
-			indices[y*w+x] = uint8(best)
-
-			er := r - palette[best][0]
-			eg := g - palette[best][1]
-			eb := b - palette[best][2]
-
-			spread := func(dx, dy int, factor float64) {
-				nx, ny := x+dx, y+dy
-				if nx < 0 || nx >= w || ny < 0 || ny >= h {
-					return
-				}
-				j := (ny*w + nx) * 3
-				rgb[j] += er * factor
-				rgb[j+1] += eg * factor
-				rgb[j+2] += eb * factor
-			}
-			spread(1, 0, 7.0/16)
-			spread(-1, 1, 3.0/16)
-			spread(0, 1, 5.0/16)
-			spread(1, 1, 1.0/16)
-		}
-	}
-	return indices
 }
 
 // writeFrame splits the portrait image at column 600, one half per controller,
@@ -336,9 +478,37 @@ func writeFrame(dst string, indices []uint8) error {
 	return os.WriteFile(dst, buf, 0o644)
 }
 
-func writeManifest(path string, names []string) error {
+func writeJPEG(path string, img *Image, quality int) error {
+	nrgba := image.NewNRGBA(image.Rect(0, 0, img.W, img.H))
+	for i, n := 0, img.W*img.H; i < n; i++ {
+		nrgba.Pix[i*4] = img.Pix[i*3]
+		nrgba.Pix[i*4+1] = img.Pix[i*3+1]
+		nrgba.Pix[i*4+2] = img.Pix[i*3+2]
+		nrgba.Pix[i*4+3] = 255
+	}
+
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	w := bufio.NewWriter(f)
+	if err := jpeg.Encode(w, nrgba, &jpeg.Options{Quality: quality}); err != nil {
+		return err
+	}
+	if err := w.Flush(); err != nil {
+		return err
+	}
+	return f.Close()
+}
+
+const manifestSettingsPrefix = "# settings: "
+
+func writeManifest(path string, names []string, fingerprint string) error {
 	var sb strings.Builder
 	sb.WriteString("# Generated by tools/imgproc - one packed frame per line.\n")
+	sb.WriteString(manifestSettingsPrefix + fingerprint + "\n")
 	for _, n := range names {
 		sb.WriteString(n)
 		sb.WriteByte('\n')
@@ -346,7 +516,22 @@ func writeManifest(path string, names []string) error {
 	return os.WriteFile(path, []byte(sb.String()), 0o644)
 }
 
-func clamp(v, lo, hi int) int {
+// readManifestSettings returns the settings the existing frames were packed
+// with, or "" if there is no manifest or it predates the settings line.
+func readManifestSettings(path string) string {
+	body, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(body), "\n") {
+		if rest, ok := strings.CutPrefix(strings.TrimSpace(line), manifestSettingsPrefix); ok {
+			return strings.TrimSpace(rest)
+		}
+	}
+	return ""
+}
+
+func clampInt(v, lo, hi int) int {
 	if v < lo {
 		return lo
 	}
